@@ -7,7 +7,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node build/index.js",
-    "dev": "tsc -w"
+    "dev": "tsc -w",
+    "publish": "npm run build && npm publish --access public"
   },
   "bin": {
     "tmux-mcp": "build/index.js"
