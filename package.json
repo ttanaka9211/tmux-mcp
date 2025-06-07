@@ -8,7 +8,8 @@
     "build": "tsc",
     "start": "node build/index.js",
     "dev": "tsc -w",
-    "publish": "npm run build && npm publish --access public"
+    "check-release": "npm run build && npm publish --dry-run",
+    "release": "npm run build && npm publish"
   },
   "bin": {
     "tmux-mcp": "build/index.js"
