@@ -38,19 +38,6 @@ interface CommandExecution {
 
 export type ShellType = 'bash' | 'zsh' | 'fish';
 
-let shellConfig: { type: ShellType } = { type: 'bash' };
-
-export function setShellConfig(config: { type: string }): void {
-  // Validate shell type
-  const validShells: ShellType[] = ['bash', 'zsh', 'fish'];
-
-  if (validShells.includes(config.type as ShellType)) {
-    shellConfig = { type: config.type as ShellType };
-  } else {
-    shellConfig = { type: 'bash' };
-  }
-}
-
 /**
  * Execute a tmux command and return the result
  */
@@ -174,17 +161,80 @@ export async function createWindow(sessionId: string, name: string): Promise<Tmu
 // Map to track ongoing command executions
 const activeCommands = new Map<string, CommandExecution>();
 
+// Cache for detected shell types per pane
+const paneShellCache = new Map<string, ShellType>();
+
 const startMarkerText = 'TMUX_MCP_START';
 const endMarkerPrefix = "TMUX_MCP_DONE_";
+
+// Detect shell type for a specific pane
+async function detectPaneShell(paneId: string): Promise<ShellType> {
+  // Check cache first
+  const cached = paneShellCache.get(paneId);
+  if (cached) return cached;
+
+  try {
+    // Get the current command/process running in the pane
+    const output = await executeTmux(`display-message -p -t '${paneId}' '#{pane_current_command}'`);
+    const cmd = output.toLowerCase().trim();
+
+    let shellType: ShellType = 'bash'; // default
+
+    if (cmd === 'fish' || cmd.endsWith('/fish')) {
+      shellType = 'fish';
+    } else if (cmd === 'zsh' || cmd.endsWith('/zsh')) {
+      shellType = 'zsh';
+    } else if (cmd === 'bash' || cmd.endsWith('/bash')) {
+      shellType = 'bash';
+    }
+    // For ssh or other commands, default to bash (most common on servers)
+
+    paneShellCache.set(paneId, shellType);
+    return shellType;
+  } catch {
+    return 'bash'; // default fallback
+  }
+}
+
+// Get end marker text based on shell type
+function getEndMarkerForShell(shellType: ShellType): string {
+  return shellType === 'fish'
+    ? `${endMarkerPrefix}$status`
+    : `${endMarkerPrefix}$?`;
+}
+
+// Get history control command based on detected shell type
+function getHistControlCmd(shellType: ShellType): string {
+  switch (shellType) {
+    case 'fish':
+      // Fish doesn't use HISTCONTROL; leading space behavior depends on fish config
+      // We skip history control for fish as it handles this differently
+      return '';
+    case 'zsh':
+      // zsh uses setopt to control history; leading space works with HIST_IGNORE_SPACE
+      // Leading space ensures this command itself is not recorded
+      return ' setopt HIST_IGNORE_SPACE 2>/dev/null';
+    case 'bash':
+    default:
+      // For bash, set HISTCONTROL to ignore commands with leading space
+      // Leading space ensures this command itself is not recorded (once HISTCONTROL is set)
+      return ' export HISTCONTROL="${HISTCONTROL:+$HISTCONTROL:}ignorespace"';
+  }
+}
 
 // Execute a command in a tmux pane and track its execution
 export async function executeCommand(paneId: string, command: string): Promise<string> {
   // Generate unique ID for this command execution
   const commandId = uuidv4();
 
-  const endMarkerText = getEndMarkerText();
+  // Detect shell type for this specific pane
+  const paneShellType = await detectPaneShell(paneId);
+  const endMarkerText = getEndMarkerForShell(paneShellType);
+  const histControlCmd = getHistControlCmd(paneShellType);
 
-  const fullCommand = `echo "${startMarkerText}"; ${command}; echo "${endMarkerText}"`;
+  // Leading space prevents command from being recorded in shell history (for bash/zsh with proper settings).
+  // For fish, the leading space behavior depends on fish configuration.
+  const fullCommand = ` echo "${startMarkerText}"; ${command}; echo "${endMarkerText}"`;
 
   // Store command in tracking map
   activeCommands.set(commandId, {
@@ -195,6 +245,12 @@ export async function executeCommand(paneId: string, command: string): Promise<s
     startTime: new Date()
   });
 
+  // First, ensure history control is set (skip for fish as it doesn't need it)
+  if (histControlCmd) {
+    await executeTmux(`send-keys -t '${paneId}' '${histControlCmd.replace(/'/g, "'\\''")}' Enter`);
+    // Small delay to ensure history control is applied before the next command
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
   // Send the command to the tmux pane
   await executeTmux(`send-keys -t '${paneId}' '${fullCommand.replace(/'/g, "'\\''")}' Enter`);
 
@@ -263,11 +319,5 @@ export function cleanupOldCommands(maxAgeMinutes: number = 60): void {
       activeCommands.delete(id);
     }
   }
-}
-
-function getEndMarkerText(): string {
-  return shellConfig.type === 'fish'
-    ? `${endMarkerPrefix}$status`
-    : `${endMarkerPrefix}$?`;
 }
 
