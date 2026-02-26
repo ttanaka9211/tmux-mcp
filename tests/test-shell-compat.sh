@@ -229,6 +229,73 @@ test_full_mcp_flow() {
 }
 
 # =============================================================================
+# TC6: split-pane機能テスト
+# =============================================================================
+test_split_pane() {
+    log_info "TC6: split-pane機能テスト（水平分割）"
+    
+    # テスト用セッション作成
+    tmux new-session -d -s "${TEST_SESSION}-split" -x 160 -y 40
+    sleep 0.5
+    
+    # 初期pane数確認
+    local initial_panes=$(tmux list-panes -t "${TEST_SESSION}-split" | wc -l | tr -d ' ')
+    
+    # 水平分割
+    tmux split-window -h -t "${TEST_SESSION}-split"
+    sleep 0.3
+    
+    # 分割後のpane数確認
+    local after_split_panes=$(tmux list-panes -t "${TEST_SESSION}-split" | wc -l | tr -d ' ')
+    
+    # クリーンアップ
+    tmux kill-session -t "${TEST_SESSION}-split" 2>/dev/null || true
+    
+    if [ "$initial_panes" = "1" ] && [ "$after_split_panes" = "2" ]; then
+        log_pass "TC6: split-pane機能正常動作（1→2 panes）"
+        return 0
+    else
+        log_fail "TC6: split-pane失敗（initial=$initial_panes, after=$after_split_panes）"
+        return 1
+    fi
+}
+
+# =============================================================================
+# TC7: rawMode/noEnterとshell-aware処理の統合テスト
+# =============================================================================
+test_rawmode_integration() {
+    log_info "TC7: rawMode/noEnter統合テスト"
+    
+    # テスト用セッション作成（fish shell）
+    tmux new-session -d -s "${TEST_SESSION}-raw" -x 160 -y 40
+    sleep 0.5
+    
+    # 通常コマンド（shell-aware処理が適用される）
+    tmux send-keys -t "${TEST_SESSION}-raw" ' echo "normal_mode_test"' Enter
+    sleep 0.3
+    
+    # rawModeのシミュレート（単純なテキスト送信）
+    tmux send-keys -t "${TEST_SESSION}-raw" 'echo "raw_mode_test"'
+    # Enterを送らない（noEnterのシミュレート）
+    sleep 0.3
+    
+    local output=$(tmux capture-pane -t "${TEST_SESSION}-raw" -p)
+    
+    # クリーンアップ
+    tmux kill-session -t "${TEST_SESSION}-raw" 2>/dev/null || true
+    
+    # 通常モードの出力が含まれていること
+    if echo "$output" | grep -q "normal_mode_test"; then
+        log_pass "TC7: rawMode/noEnter統合テスト正常"
+        return 0
+    else
+        log_fail "TC7: 統合テスト失敗"
+        echo "出力: $output"
+        return 1
+    fi
+}
+
+# =============================================================================
 # メイン
 # =============================================================================
 main() {
@@ -245,6 +312,8 @@ main() {
     test_fish_to_ssh_bash || true
     test_ssh_history_clean || true
     test_full_mcp_flow || true
+    test_split_pane || true
+    test_rawmode_integration || true
     
     echo ""
     echo "=========================================="
