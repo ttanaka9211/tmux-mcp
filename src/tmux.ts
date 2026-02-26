@@ -164,8 +164,8 @@ const activeCommands = new Map<string, CommandExecution>();
 // Cache for detected shell types per pane
 const paneShellCache = new Map<string, ShellType>();
 
-// Cache for SSH panes that have been initialized with HISTCONTROL
-const initializedSSHPanes = new Set<string>();
+// Cache for panes that have been initialized with HISTCONTROL
+const initializedPanes = new Set<string>();
 
 const startMarkerText = 'TMUX_MCP_START';
 const endMarkerPrefix = "TMUX_MCP_DONE_";
@@ -211,11 +211,18 @@ async function isSSHPane(paneId: string): Promise<boolean> {
   }
 }
 
-// Detect remote shell type by executing a command via SSH
-async function detectRemoteShell(paneId: string): Promise<ShellType> {
-  // Send a command to detect shell type and wait for result
-  const detectCmd = ` echo ${initMarker}_SHELL_$0`;
-  await executeTmux(`send-keys -t '${paneId}' '${detectCmd}' Enter`);
+// Detect remote shell type and initialize HISTCONTROL in a single command
+// This ensures the detection command itself doesn't pollute history
+async function detectAndInitializeRemoteShell(paneId: string): Promise<ShellType> {
+  // Single command that:
+  // 1. Sets HISTCONTROL (for bash) or HIST_IGNORE_SPACE (for zsh) 
+  // 2. Outputs shell type for detection
+  // Leading space + HISTCONTROL setting ensures minimal history pollution
+  // For bash: HISTCONTROL takes effect immediately for subsequent commands
+  // For zsh: setopt takes effect immediately
+  // For fish: No equivalent, but fish is rare on servers
+  const initAndDetectCmd = ` export HISTCONTROL=ignorespace 2>/dev/null; setopt HIST_IGNORE_SPACE 2>/dev/null; echo ${initMarker}_SHELL_$0`;
+  await executeTmux(`send-keys -t '${paneId}' '${initAndDetectCmd}' Enter`);
   
   // Wait for the command to complete
   await new Promise(resolve => setTimeout(resolve, 300));
@@ -225,43 +232,51 @@ async function detectRemoteShell(paneId: string): Promise<ShellType> {
   
   // Parse the shell type from output
   const match = content.match(new RegExp(`${initMarker}_SHELL_(-?\\w+)`));
+  let shellType: ShellType = 'bash'; // default
+  
   if (match) {
     const shell = match[1].toLowerCase().replace(/^-/, ''); // Remove leading dash (login shell)
     if (shell === 'fish' || shell.endsWith('/fish')) {
-      return 'fish';
+      shellType = 'fish';
     } else if (shell === 'zsh' || shell.endsWith('/zsh')) {
-      return 'zsh';
+      shellType = 'zsh';
     }
   }
-  return 'bash'; // default
+  
+  // Mark as initialized (HISTCONTROL/HIST_IGNORE_SPACE already set in the combined command)
+  initializedPanes.add(paneId);
+  paneShellCache.set(paneId, shellType);
+  
+  return shellType;
 }
 
-// Initialize SSH pane with proper HISTCONTROL setting
-async function initializeSSHPane(paneId: string): Promise<ShellType> {
-  // Detect remote shell type
-  const remoteShellType = await detectRemoteShell(paneId);
-  
-  // Cache the detected shell type for this pane
-  paneShellCache.set(paneId, remoteShellType);
-  
-  // Set up history control based on remote shell type
-  if (remoteShellType === 'bash') {
+// Initialize pane with proper HISTCONTROL setting
+// Works for both local and SSH panes
+async function initializePane(paneId: string, shellType: ShellType): Promise<void> {
+  // Set up history control based on shell type
+  // All commands start with space to prevent history recording (if HISTCONTROL is set)
+  if (shellType === 'bash') {
     // For bash, export HISTCONTROL to ignore commands starting with space
     const initCmd = ` export HISTCONTROL="\${HISTCONTROL:+\$HISTCONTROL:}ignorespace"; echo ${initMarker}`;
     await executeTmux(`send-keys -t '${paneId}' '${initCmd}' Enter`);
     await new Promise(resolve => setTimeout(resolve, 200));
-  } else if (remoteShellType === 'zsh') {
+  } else if (shellType === 'zsh') {
     // For zsh, set HIST_IGNORE_SPACE option
     const initCmd = ` setopt HIST_IGNORE_SPACE 2>/dev/null; echo ${initMarker}`;
     await executeTmux(`send-keys -t '${paneId}' '${initCmd}' Enter`);
     await new Promise(resolve => setTimeout(resolve, 200));
   }
-  // For fish, leading space is typically enough (configurable via fish_history)
+  // For fish, history is controlled by fish_history variable
+  // Leading space doesn't work by default, but we handle fish differently in command execution
   
   // Mark this pane as initialized
-  initializedSSHPanes.add(paneId);
-  
-  return remoteShellType;
+  initializedPanes.add(paneId);
+}
+
+// Initialize SSH pane - detects remote shell and sets up history control in one command
+async function initializeSSHPane(paneId: string): Promise<ShellType> {
+  // Combined detection and initialization (no separate initializePane call needed)
+  return await detectAndInitializeRemoteShell(paneId);
 }
 
 // Get end marker text based on shell type
@@ -271,25 +286,30 @@ function getEndMarkerForShell(shellType: ShellType): string {
     : `${endMarkerPrefix}$?`;
 }
 
-// Get inline history control prefix based on shell type
-// This is prepended to the command in the same line to ensure history ignore is active
-function getInlineHistControlPrefix(shellType: ShellType): string {
-  switch (shellType) {
-    case 'fish':
-      // Fish uses leading space with fish_history variable or hist_ignore_space
-      // No inline prefix needed; leading space on the full command handles it
-      return '';
-    case 'zsh':
-      // For zsh, set HIST_IGNORE_SPACE inline before the command
-      // Using setopt in a subshell doesn't work, so we use fc -p to pause history
-      // Actually, leading space works if HIST_IGNORE_SPACE is set in .zshrc
-      // For remote servers, we use a more reliable approach: set and execute in same line
-      return 'setopt HIST_IGNORE_SPACE 2>/dev/null; ';
-    case 'bash':
-    default:
-      // For bash, set HISTCONTROL inline in the same command line
-      // This ensures the setting is active before the command is recorded
-      return 'HISTCONTROL=ignorespace; ';
+// Build command for fish shell (no HISTCONTROL, uses fish-specific approach)
+function buildFishCommand(command: string): string {
+  // Fish doesn't support HISTCONTROL, but we can use 'builtin history delete' after execution
+  // Or we can use 'begin; end' block which doesn't record intermediate commands
+  // Simplest approach: just run the command with markers (fish history is configurable)
+  return `echo "${startMarkerText}"; ${command}; echo "${endMarkerPrefix}\\$status"`;
+}
+
+// Build command for bash/zsh (with HISTCONTROL prefix for safety)
+function buildBashZshCommand(command: string, shellType: ShellType, isInitialized: boolean): string {
+  const endMarker = getEndMarkerForShell(shellType);
+  
+  if (isInitialized) {
+    // Pane is initialized, HISTCONTROL/HIST_IGNORE_SPACE is set
+    // Leading space is enough to prevent history recording
+    return ` echo "${startMarkerText}"; ${command}; echo "${endMarker}"`;
+  } else {
+    // Pane not initialized yet, include inline HISTCONTROL setting
+    if (shellType === 'zsh') {
+      return ` setopt HIST_IGNORE_SPACE 2>/dev/null; echo "${startMarkerText}"; ${command}; echo "${endMarker}"`;
+    } else {
+      // bash
+      return ` HISTCONTROL=ignorespace; echo "${startMarkerText}"; ${command}; echo "${endMarker}"`;
+    }
   }
 }
 
@@ -298,27 +318,40 @@ export async function executeCommand(paneId: string, command: string): Promise<s
   // Generate unique ID for this command execution
   const commandId = uuidv4();
 
-  // Check if this is an SSH pane that needs initialization
+  // Check if this is an SSH pane
   const isSSH = await isSSHPane(paneId);
   
   let shellType: ShellType;
+  let isInitialized = initializedPanes.has(paneId);
   
-  if (isSSH && !initializedSSHPanes.has(paneId)) {
+  if (isSSH && !isInitialized) {
     // Initialize SSH pane (detects remote shell and sets up HISTCONTROL)
     shellType = await initializeSSHPane(paneId);
-  } else {
-    // Use cached shell type or detect local shell
+    isInitialized = true;
+  } else if (!isSSH && !isInitialized) {
+    // Local pane - detect shell and initialize if needed
     shellType = await detectPaneShell(paneId);
+    
+    // For local non-fish shells, initialize HISTCONTROL
+    if (shellType !== 'fish') {
+      await initializePane(paneId, shellType);
+      isInitialized = true;
+    }
+  } else {
+    // Use cached shell type
+    shellType = paneShellCache.get(paneId) || await detectPaneShell(paneId);
   }
-  
-  const endMarkerText = getEndMarkerForShell(shellType);
 
-  // Build the full command
-  // Leading space prevents command from being recorded in shell history
-  // HISTCONTROL/HIST_IGNORE_SPACE has already been set up for SSH panes
-  // For local shells, we still include inline prefix as a fallback
-  const histControlPrefix = isSSH ? '' : getInlineHistControlPrefix(shellType);
-  const fullCommand = ` ${histControlPrefix}echo "${startMarkerText}"; ${command}; echo "${endMarkerText}"`;
+  // Build the full command based on shell type
+  let fullCommand: string;
+  
+  if (shellType === 'fish') {
+    // Fish shell - no HISTCONTROL support
+    fullCommand = buildFishCommand(command);
+  } else {
+    // Bash or Zsh
+    fullCommand = buildBashZshCommand(command, shellType, isInitialized);
+  }
 
   // Store command in tracking map
   activeCommands.set(commandId, {
@@ -398,4 +431,3 @@ export function cleanupOldCommands(maxAgeMinutes: number = 60): void {
     }
   }
 }
-
