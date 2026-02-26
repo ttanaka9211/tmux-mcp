@@ -34,6 +34,7 @@ interface CommandExecution {
   startTime: Date;
   result?: string;
   exitCode?: number;
+  rawMode?: boolean;
 }
 
 export type ShellType = 'bash' | 'zsh' | 'fish';
@@ -137,8 +138,9 @@ export async function listPanes(windowId: string): Promise<TmuxPane[]> {
 /**
  * Capture content from a specific pane, by default the latest 200 lines.
  */
-export async function capturePaneContent(paneId: string, lines: number = 200): Promise<string> {
-  return executeTmux(`capture-pane -p -t '${paneId}' -S -${lines} -E -`);
+export async function capturePaneContent(paneId: string, lines: number = 200, includeColors: boolean = false): Promise<string> {
+  const colorFlag = includeColors ? '-e' : '';
+  return executeTmux(`capture-pane -p ${colorFlag} -t '${paneId}' -S -${lines} -E -`);
 }
 
 /**
@@ -156,6 +158,66 @@ export async function createWindow(sessionId: string, name: string): Promise<Tmu
   const output = await executeTmux(`new-window -t '${sessionId}' -n '${name}'`);
   const windows = await listWindows(sessionId);
   return windows.find(window => window.name === name) || null;
+}
+
+/**
+ * Kill a tmux session by ID
+ */
+export async function killSession(sessionId: string): Promise<void> {
+  await executeTmux(`kill-session -t '${sessionId}'`);
+}
+
+/**
+ * Kill a tmux window by ID
+ */
+export async function killWindow(windowId: string): Promise<void> {
+  await executeTmux(`kill-window -t '${windowId}'`);
+}
+
+/**
+ * Kill a tmux pane by ID
+ */
+export async function killPane(paneId: string): Promise<void> {
+  await executeTmux(`kill-pane -t '${paneId}'`);
+}
+
+/**
+ * Split a tmux pane horizontally or vertically
+ */
+export async function splitPane(
+  targetPaneId: string,
+  direction: 'horizontal' | 'vertical' = 'vertical',
+  size?: number
+): Promise<TmuxPane | null> {
+  // Build the split-window command
+  let splitCommand = 'split-window';
+
+  // Add direction flag (-h for horizontal, -v for vertical)
+  if (direction === 'horizontal') {
+    splitCommand += ' -h';
+  } else {
+    splitCommand += ' -v';
+  }
+
+  // Add target pane
+  splitCommand += ` -t '${targetPaneId}'`;
+
+  // Add size if specified (as percentage)
+  if (size !== undefined && size > 0 && size < 100) {
+    splitCommand += ` -p ${size}`;
+  }
+
+  // Execute the split command
+  await executeTmux(splitCommand);
+
+  // Get the window ID from the target pane to list all panes
+  const windowInfo = await executeTmux(`display-message -p -t '${targetPaneId}' '#{window_id}'`);
+
+  // List all panes in the window to find the newly created one
+  const panes = await listPanes(windowInfo);
+
+  // The newest pane is typically the last one in the list
+  return panes.length > 0 ? panes[panes.length - 1] : null;
 }
 
 // Map to track ongoing command executions
@@ -314,43 +376,49 @@ function buildBashZshCommand(command: string, shellType: ShellType, isInitialize
 }
 
 // Execute a command in a tmux pane and track its execution
-export async function executeCommand(paneId: string, command: string): Promise<string> {
+export async function executeCommand(paneId: string, command: string, rawMode?: boolean, noEnter?: boolean): Promise<string> {
   // Generate unique ID for this command execution
   const commandId = uuidv4();
 
-  // Check if this is an SSH pane
-  const isSSH = await isSSHPane(paneId);
-  
-  let shellType: ShellType;
-  let isInitialized = initializedPanes.has(paneId);
-  
-  if (isSSH && !isInitialized) {
-    // Initialize SSH pane (detects remote shell and sets up HISTCONTROL)
-    shellType = await initializeSSHPane(paneId);
-    isInitialized = true;
-  } else if (!isSSH && !isInitialized) {
-    // Local pane - detect shell and initialize if needed
-    shellType = await detectPaneShell(paneId);
-    
-    // For local non-fish shells, initialize HISTCONTROL
-    if (shellType !== 'fish') {
-      await initializePane(paneId, shellType);
-      isInitialized = true;
-    }
-  } else {
-    // Use cached shell type
-    shellType = paneShellCache.get(paneId) || await detectPaneShell(paneId);
-  }
-
-  // Build the full command based on shell type
   let fullCommand: string;
   
-  if (shellType === 'fish') {
-    // Fish shell - no HISTCONTROL support
-    fullCommand = buildFishCommand(command);
+  if (rawMode || noEnter) {
+    // Raw mode or noEnter - use command as-is
+    fullCommand = command;
   } else {
-    // Bash or Zsh
-    fullCommand = buildBashZshCommand(command, shellType, isInitialized);
+    // Normal mode - use shell-aware command building with history pollution prevention
+    // Check if this is an SSH pane
+    const isSSH = await isSSHPane(paneId);
+    
+    let shellType: ShellType;
+    let isInitialized = initializedPanes.has(paneId);
+    
+    if (isSSH && !isInitialized) {
+      // Initialize SSH pane (detects remote shell and sets up HISTCONTROL)
+      shellType = await initializeSSHPane(paneId);
+      isInitialized = true;
+    } else if (!isSSH && !isInitialized) {
+      // Local pane - detect shell and initialize if needed
+      shellType = await detectPaneShell(paneId);
+      
+      // For local non-fish shells, initialize HISTCONTROL
+      if (shellType !== 'fish') {
+        await initializePane(paneId, shellType);
+        isInitialized = true;
+      }
+    } else {
+      // Use cached shell type
+      shellType = paneShellCache.get(paneId) || await detectPaneShell(paneId);
+    }
+
+    // Build the full command based on shell type
+    if (shellType === 'fish') {
+      // Fish shell - no HISTCONTROL support
+      fullCommand = buildFishCommand(command);
+    } else {
+      // Bash or Zsh
+      fullCommand = buildBashZshCommand(command, shellType, isInitialized);
+    }
   }
 
   // Store command in tracking map
@@ -359,11 +427,31 @@ export async function executeCommand(paneId: string, command: string): Promise<s
     paneId,
     command,
     status: 'pending',
-    startTime: new Date()
+    startTime: new Date(),
+    rawMode: rawMode || noEnter
   });
 
   // Send the command to the tmux pane
-  await executeTmux(`send-keys -t '${paneId}' '${fullCommand.replace(/'/g, "'\\''")}' Enter`);
+  if (noEnter) {
+    // Check if this is a special key (e.g., Up, Down, Left, Right, Escape, Tab, etc.)
+    // Special keys in tmux are typically capitalized or have special names
+    const specialKeys = ['Up', 'Down', 'Left', 'Right', 'Escape', 'Tab', 'Enter', 'Space',
+      'BSpace', 'Delete', 'Home', 'End', 'PageUp', 'PageDown',
+      'F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12'];
+
+    if (specialKeys.includes(fullCommand)) {
+      // Send special key as-is
+      await executeTmux(`send-keys -t '${paneId}' ${fullCommand}`);
+    } else {
+      // For regular text, send each character individually to ensure proper processing
+      // This handles both single characters (like 'q', 'f') and strings (like 'beam')
+      for (const char of fullCommand) {
+        await executeTmux(`send-keys -t '${paneId}' '${char.replace(/'/g, "'\\''")}'`);
+      }
+    }
+  } else {
+    await executeTmux(`send-keys -t '${paneId}' '${fullCommand.replace(/'/g, "'\\''")}' Enter`);
+  }
 
   return commandId;
 }
@@ -375,6 +463,11 @@ export async function checkCommandStatus(commandId: string): Promise<CommandExec
   if (command.status !== 'pending') return command;
 
   const content = await capturePaneContent(command.paneId, 1000);
+
+  if (command.rawMode) {
+    command.result = 'Status tracking unavailable for rawMode commands. Use capture-pane to monitor interactive apps instead.';
+    return command;
+  }
 
   // Find the last occurrence of the markers
   const startIndex = content.lastIndexOf(startMarkerText);
