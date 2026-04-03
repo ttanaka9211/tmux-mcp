@@ -20,8 +20,15 @@ NC='\033[0m'
 # テスト用セッション名
 TEST_SESSION="tmux-mcp-test-$$"
 
-# SSH先
-SSH_HOST="${SSH_TEST_HOST:-vps-yamada-web01}"
+# SSH先（環境変数 SSH_TEST_HOST で指定してください）
+# 例: SSH_TEST_HOST=your-server bash tests/test-shell-compat.sh
+SSH_HOST="${SSH_TEST_HOST:-}"
+
+if [ -z "$SSH_HOST" ]; then
+    echo "ERROR: SSH_TEST_HOST environment variable is required"
+    echo "Usage: SSH_TEST_HOST=your-server bash tests/test-shell-compat.sh"
+    exit 1
+fi
 
 # 結果カウンター
 PASSED=0
