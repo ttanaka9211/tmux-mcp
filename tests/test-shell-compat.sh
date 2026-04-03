@@ -49,18 +49,19 @@ cleanup() {
 trap cleanup EXIT
 
 # =============================================================================
-# TC1: ローカルfishでコマンド実行（修正後のコード経由）
+# TC1: ローカルfishでコマンド実行 + $status が数値として展開されること
 # =============================================================================
 test_local_fish_via_mcp() {
-    log_info "TC1: ローカルfishでコマンド実行（fishではHISTCONTROLを使わない）"
+    log_info "TC1: ローカルfishでコマンド実行（$status が数値に展開されること）"
     
     # fishシェルでセッション作成
     tmux new-session -d -s "$TEST_SESSION" fish
     sleep 0.5
     
-    # 修正後のコード: fishの場合はHISTCONTROLを使わない
-    # fish用のコマンド形式をテスト
-    local test_cmd='echo "TMUX_MCP_START"; echo "TEST_MARKER_TC1"; echo "TMUX_MCP_DONE_$status"'
+    # 修正後のコード: set __exit $status を使って数値を展開
+    # 旧コード: echo "TMUX_MCP_DONE_\$status" → リテラル文字列になりマッチ失敗
+    # 新コード: set __exit $status; echo "TMUX_MCP_DONE_$__exit" → 数値に展開
+    local test_cmd='echo "TMUX_MCP_START"; echo "TEST_MARKER_TC1"; set __exit $status; echo "TMUX_MCP_DONE_$__exit"'
     tmux send-keys -t "$TEST_SESSION" "$test_cmd" Enter
     sleep 0.5
     
@@ -72,10 +73,49 @@ test_local_fish_via_mcp() {
         echo "出力: $output"
         return 1
     elif echo "$output" | grep -q "TEST_MARKER_TC1"; then
-        log_pass "TC1: fishでコマンド正常実行（HISTCONTROL不使用）"
-        return 0
+        # $status が数値に展開されているか確認（TMUX_MCP_DONE_0 のような形式）
+        if echo "$output" | grep -qE "TMUX_MCP_DONE_[0-9]+"; then
+            log_pass "TC1: fishでコマンド正常実行・\$status が数値に展開された"
+            return 0
+        else
+            log_fail "TC1: TMUX_MCP_DONE_ の後に数値がない（\$status が展開されていない）"
+            echo "出力: $output"
+            return 1
+        fi
     else
         log_fail "TC1: 予期しない結果"
+        echo "出力: $output"
+        return 1
+    fi
+}
+
+# =============================================================================
+# TC1b: 旧コード（\\$status）が失敗することの確認（リグレッションテスト）
+# =============================================================================
+test_fish_old_code_regression() {
+    log_info "TC1b: 旧コード（\\$status リテラル）がマーカーマッチに失敗することを確認"
+
+    tmux kill-session -t "$TEST_SESSION" 2>/dev/null || true
+    tmux new-session -d -s "$TEST_SESSION" fish
+    sleep 0.5
+
+    # 旧コードが生成していたコマンド（\$status がリテラルになる）
+    local old_cmd='echo "TMUX_MCP_START"; echo "OLD_CODE_TEST"; echo "TMUX_MCP_DONE_\$status"'
+    tmux send-keys -t "$TEST_SESSION" "$old_cmd" Enter
+    sleep 0.5
+
+    local output=$(tmux capture-pane -t "$TEST_SESSION" -p)
+
+    # 旧コードでは TMUX_MCP_DONE_$status（数値でない）が出力される
+    if echo "$output" | grep -qE "TMUX_MCP_DONE_[0-9]+"; then
+        log_fail "TC1b: 旧コードが数値を返した（想定外）"
+        echo "出力: $output"
+        return 1
+    elif echo "$output" | grep -q 'TMUX_MCP_DONE_$status'; then
+        log_pass "TC1b: 旧コードはリテラル文字列を返す（マーカーマッチ失敗を確認）"
+        return 0
+    else
+        log_fail "TC1b: 予期しない結果"
         echo "出力: $output"
         return 1
     fi
@@ -308,6 +348,7 @@ main() {
     
     # テスト実行
     test_local_fish_via_mcp || true
+    test_fish_old_code_regression || true
     test_local_bash || true
     test_fish_to_ssh_bash || true
     test_ssh_history_clean || true
