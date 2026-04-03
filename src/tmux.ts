@@ -350,10 +350,9 @@ function getEndMarkerForShell(shellType: ShellType): string {
 
 // Build command for fish shell (no HISTCONTROL, uses fish-specific approach)
 function buildFishCommand(command: string): string {
-  // Fish doesn't support HISTCONTROL, but we can use 'builtin history delete' after execution
-  // Or we can use 'begin; end' block which doesn't record intermediate commands
-  // Simplest approach: just run the command with markers (fish history is configurable)
-  return `echo "${startMarkerText}"; ${command}; echo "${endMarkerPrefix}\\$status"`;
+  // Fish uses $status instead of $?
+  // Must NOT escape $status so fish expands it to the actual exit code
+  return `echo "${startMarkerText}"; ${command}; set __exit $status; echo "${endMarkerPrefix}$__exit"`;
 }
 
 // Build command for bash/zsh (with HISTCONTROL prefix for safety)
